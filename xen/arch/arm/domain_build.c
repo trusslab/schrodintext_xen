@@ -125,10 +125,13 @@ static bool insert_11_bank(struct domain *d,
         D11PRINT("Allocation below bank 0 is too small, not using\n");
         goto fail;
     }
-
-    res = guest_physmap_add_page(d, _gfn(spfn), _mfn(spfn), order);
-    if ( res )
-        panic("Failed map pages to DOM0: %d", res);
+    
+    for (i = 0; i < (1 << order); i++) {
+	    guest_physmap_add_page(d, spfn + i, spfn + i, 0);
+	    guest_display_physmap_add_page(d, spfn + i, spfn + i, 0);
+	    guest_gpu_physmap_add_page(d, spfn + i, spfn + i, 0);
+    }
+    res = 1;
 
     kinfo->unassigned_mem -= size;
 

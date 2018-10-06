@@ -52,7 +52,7 @@ static const paddr_t level_masks[] =
 static const uint8_t level_orders[] =
     { ZEROETH_ORDER, FIRST_ORDER, SECOND_ORDER, THIRD_ORDER };
 
-static void p2m_flush_tlb(struct p2m_domain *p2m);
+void p2m_flush_tlb(struct p2m_domain *p2m);
 
 /* Unlock the flush and do a P2M TLB flush if necessary */
 void p2m_write_unlock(struct p2m_domain *p2m)
@@ -104,6 +104,77 @@ void dump_p2m_lookup(struct domain *d, paddr_t addr)
                  P2M_ROOT_LEVEL, P2M_ROOT_PAGES);
 }
 
+void dump_gpu_p2m_lookup(struct domain *d, paddr_t addr)
+{
+    struct p2m_domain *p2m = &d->arch.gpu_p2m;
+
+    printk("dom%d IPA 0x%"PRIpaddr"\n", d->domain_id, addr);
+
+    printk("P2M @ %p mfn:0x%lx\n",
+           p2m->root, page_to_mfn(p2m->root));
+
+    dump_pt_walk(page_to_maddr(p2m->root), addr,
+                 P2M_ROOT_LEVEL, P2M_ROOT_PAGES);
+}
+
+void dump_display_p2m_lookup(struct domain *d, paddr_t addr)
+{
+    struct p2m_domain *p2m = &d->arch.display_p2m;
+
+    printk("dom%d IPA 0x%"PRIpaddr"\n", d->domain_id, addr);
+
+    printk("P2M @ %p mfn:0x%lx\n",
+           p2m->root, page_to_mfn(p2m->root));
+
+    dump_pt_walk(page_to_maddr(p2m->root), addr,
+                 P2M_ROOT_LEVEL, P2M_ROOT_PAGES);
+}
+
+void __schrodintext_change_page_permission(paddr_t ttbr, paddr_t addr,
+                  unsigned int root_level,
+                  unsigned int nr_root_tables,
+		  int log_type, int op);
+
+// Reused code from dump_p2m_lookup().
+void schrodintext_change_page_permission(struct domain *d, paddr_t addr,
+						int log_type, int op)
+{
+    struct p2m_domain *p2m = &d->arch.p2m;
+
+    PRINTK0("dom%d IPA 0x%"PRIpaddr"\n", d->domain_id, addr);
+
+    PRINTK0("P2M @ %p mfn:0x%lx\n",
+           p2m->root, page_to_mfn(p2m->root));
+
+    __schrodintext_change_page_permission(page_to_maddr(p2m->root), addr,
+                 P2M_ROOT_LEVEL, P2M_ROOT_PAGES, log_type, op);
+
+    p2m_flush_tlb(p2m);
+}
+
+lpae_t __schrobuf_hide_page(paddr_t ttbr, paddr_t addr,
+                  unsigned int root_level,
+                  unsigned int nr_root_tables,
+				  lpae_t white_pte);
+
+// Reused code from dump_p2m_lookup().
+lpae_t _schrobuf_hide_page(struct p2m_domain *p2m, paddr_t addr, lpae_t white_pte)
+{
+    return __schrobuf_hide_page(page_to_maddr(p2m->root), addr,
+           				        P2M_ROOT_LEVEL, P2M_ROOT_PAGES, white_pte);
+}
+
+void __schrobuf_unhide_page(paddr_t ttbr, paddr_t addr,
+                  unsigned int root_level,
+                  unsigned int nr_root_tables,
+				  lpae_t orig_pte);
+				  
+void _schrobuf_unhide_page(struct p2m_domain *p2m, paddr_t addr, lpae_t orig_pte)
+{
+	__schrobuf_unhide_page(page_to_maddr(p2m->root), addr,
+           				 P2M_ROOT_LEVEL, P2M_ROOT_PAGES, orig_pte);
+}
+
 void p2m_save_state(struct vcpu *p)
 {
     p->arch.sctlr = READ_SYSREG(SCTLR_EL1);
@@ -138,7 +209,7 @@ void p2m_restore_state(struct vcpu *n)
     *last_vcpu_ran = n->vcpu_id;
 }
 
-static void p2m_flush_tlb(struct p2m_domain *p2m)
+void p2m_flush_tlb(struct p2m_domain *p2m)
 {
     unsigned long flags = 0;
     uint64_t ovttbr;
@@ -377,7 +448,19 @@ out:
 mfn_t p2m_lookup(struct domain *d, gfn_t gfn, p2m_type_t *t)
 {
     mfn_t ret;
-    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+    struct p2m_domain *p2m = p2m_get_hostp2m(d); // macro for &d->arch.root
+
+    p2m_read_lock(p2m);
+    ret = p2m_get_entry(p2m, gfn, t, NULL, NULL);
+    p2m_read_unlock(p2m);
+
+    return ret;
+}
+
+mfn_t display_p2m_lookup(struct domain *d, gfn_t gfn, p2m_type_t *t)
+{
+    mfn_t ret;
+    struct p2m_domain *p2m = &d->arch.display_p2m;
 
     p2m_read_lock(p2m);
     ret = p2m_get_entry(p2m, gfn, t, NULL, NULL);
@@ -471,7 +554,7 @@ static void p2m_set_permission(lpae_t *e, p2m_type_t t, p2m_access_t a)
     }
 }
 
-static lpae_t mfn_to_p2m_entry(mfn_t mfn, p2m_type_t t, p2m_access_t a)
+lpae_t mfn_to_p2m_entry(mfn_t mfn, p2m_type_t t, p2m_access_t a)
 {
     /*
      * sh, xn and write bit will be defined in the following switches
@@ -1037,6 +1120,40 @@ static inline int p2m_insert_mapping(struct domain *d,
     return rc;
 }
 
+// Add separate calls for display/gpu p2m_insert_mappings because p2m_get_hostp2m() 
+// will automatically get the root p2m instead of the separate p2m's we want.
+static inline int display_p2m_insert_mapping(struct domain *d,
+                                     gfn_t start_gfn,
+                                     unsigned long nr,
+                                     mfn_t mfn,
+                                     p2m_type_t t)
+{
+    struct p2m_domain *p2m = &d->arch.display_p2m;
+    int rc;
+
+    p2m_write_lock(p2m);
+    rc = p2m_set_entry(p2m, start_gfn, nr, mfn, t, p2m->default_access);
+    p2m_write_unlock(p2m);
+
+    return rc;
+}
+
+static inline int gpu_p2m_insert_mapping(struct domain *d,
+                                     gfn_t start_gfn,
+                                     unsigned long nr,
+                                     mfn_t mfn,
+                                     p2m_type_t t)
+{
+    struct p2m_domain *p2m = &d->arch.gpu_p2m;
+    int rc;
+
+    p2m_write_lock(p2m);
+    rc = p2m_set_entry(p2m, start_gfn, nr, mfn, t, p2m->default_access);
+    p2m_write_unlock(p2m);
+
+    return rc;
+}
+
 static inline int p2m_remove_mapping(struct domain *d,
                                      gfn_t start_gfn,
                                      unsigned long nr,
@@ -1116,15 +1233,34 @@ int guest_physmap_add_entry(struct domain *d,
     return p2m_insert_mapping(d, gfn, (1 << page_order), mfn, t);
 }
 
+int guest_display_physmap_add_entry(struct domain *d,
+                            gfn_t gfn,
+                            mfn_t mfn,
+                            unsigned long page_order,
+                            p2m_type_t t)
+{
+    int ret = display_p2m_insert_mapping(d, gfn, (1 << page_order), mfn, t);
+    return ret;
+}
+
+int guest_gpu_physmap_add_entry(struct domain *d,
+                            gfn_t gfn,
+                            mfn_t mfn,
+                            unsigned long page_order,
+                            p2m_type_t t)
+{
+    int ret = gpu_p2m_insert_mapping(d, gfn, (1 << page_order), mfn, t);
+    return ret;
+}
+
 int guest_physmap_remove_page(struct domain *d, gfn_t gfn, mfn_t mfn,
                               unsigned int page_order)
 {
     return p2m_remove_mapping(d, gfn, (1 << page_order), mfn);
 }
 
-static int p2m_alloc_table(struct domain *d)
+static int __p2m_alloc_table(struct domain *d, struct p2m_domain *p2m, bool main)
 {
-    struct p2m_domain *p2m = p2m_get_hostp2m(d);
     struct page_info *page;
     unsigned int i;
 
@@ -1138,17 +1274,35 @@ static int p2m_alloc_table(struct domain *d)
 
     p2m->root = page;
 
-    p2m->vttbr = page_to_maddr(p2m->root) | ((uint64_t)p2m->vmid << 48);
+    if (main) {
+        p2m->vttbr = page_to_maddr(p2m->root) | ((uint64_t)p2m->vmid << 48);
 
     /*
      * Make sure that all TLBs corresponding to the new VMID are flushed
      * before using it
      */
-    p2m_flush_tlb(p2m);
+        p2m_flush_tlb(p2m);
+    }
+
+    printk("domain = %#lx\n", (unsigned long) d);
 
     return 0;
 }
 
+int p2m_alloc_table(struct domain *d)
+{
+    return __p2m_alloc_table(d, &d->arch.p2m, true);
+}
+
+int display_p2m_alloc_table(struct domain *d)
+{
+    return __p2m_alloc_table(d, &d->arch.display_p2m, false);
+}
+
+int gpu_p2m_alloc_table(struct domain *d)
+{
+    return __p2m_alloc_table(d, &d->arch.gpu_p2m, false);
+}
 
 static spinlock_t vmid_alloc_lock = SPIN_LOCK_UNLOCKED;
 
@@ -1173,10 +1327,8 @@ static void p2m_vmid_allocator_init(void)
     set_bit(INVALID_VMID, vmid_mask);
 }
 
-static int p2m_alloc_vmid(struct domain *d)
+static int p2m_alloc_vmid(struct p2m_domain *p2m)
 {
-    struct p2m_domain *p2m = p2m_get_hostp2m(d);
-
     int rc, nr;
 
     spin_lock(&vmid_alloc_lock);
@@ -1187,8 +1339,8 @@ static int p2m_alloc_vmid(struct domain *d)
 
     if ( nr == MAX_VMID )
     {
-        rc = -EBUSY;
-        printk(XENLOG_ERR "p2m.c: dom%d: VMID pool exhausted\n", d->domain_id);
+        rc = -EBUSY;     
+		PRINTK0(XENLOG_ERR "p2m.c: VMID pool exhausted\n");
         goto out;
     }
 
@@ -1237,9 +1389,8 @@ void p2m_teardown(struct domain *d)
     p2m->domain = NULL;
 }
 
-int p2m_init(struct domain *d)
+int __p2m_init(struct domain *d, struct p2m_domain *p2m, int p2m_is_display, int p2m_is_gpu)
 {
-    struct p2m_domain *p2m = p2m_get_hostp2m(d);
     int rc = 0;
     unsigned int cpu;
 
@@ -1248,7 +1399,7 @@ int p2m_init(struct domain *d)
 
     p2m->vmid = INVALID_VMID;
 
-    rc = p2m_alloc_vmid(d);
+    rc = p2m_alloc_vmid(p2m);
     if ( rc != 0 )
         return rc;
 
@@ -1267,7 +1418,12 @@ int p2m_init(struct domain *d)
     p2m->clean_pte = iommu_enabled &&
         !iommu_has_feature(d, IOMMU_FEAT_COHERENT_WALK);
 
-    rc = p2m_alloc_table(d);
+    if (p2m_is_display)
+		rc = display_p2m_alloc_table(d);
+    else if (p2m_is_gpu)
+		rc = gpu_p2m_alloc_table(d);
+    else
+    	rc = p2m_alloc_table(d);
 
     /*
      * Make sure that the type chosen to is able to store the an vCPU ID
@@ -1288,6 +1444,26 @@ int p2m_init(struct domain *d)
     p2m->domain = d;
 
     return rc;
+}
+
+int p2m_init(struct domain *d)
+{
+    int rc;
+    rc = __p2m_init(d, &d->arch.p2m, 0, 0);
+    if (rc) {
+		PRINTK_ERR("Initializing root p2m failed, returning (will not attempt to init display/gpu p2m\n");
+        return rc;
+    }
+    
+    rc = __p2m_init(d, &d->arch.display_p2m, 1, 0);
+    if (rc)
+        PRINTK_ERR("Initializing display_p2m failed\n");
+    
+    rc = __p2m_init(d, &d->arch.gpu_p2m, 0, 1);
+    if (rc)
+        PRINTK_ERR("Initializing gpu_p2m failed\n");
+
+    return 0;
 }
 
 /*

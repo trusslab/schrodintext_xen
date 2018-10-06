@@ -159,7 +159,7 @@ static void __iomem *devm_ioremap_resource(struct device *dev,
 		dev_err(dev, "Invalid resource\n");
 		return ERR_PTR(-EINVAL);
 	}
-
+	
 	ptr = ioremap_nocache(res->addr, res->size);
 	if (!ptr) {
 		dev_err(dev,
@@ -1014,6 +1014,9 @@ static void arm_smmu_flush_pgtable(struct arm_smmu_device *smmu, void *addr,
 }
 #endif
 
+void dump_display_p2m_lookup(struct domain *d, paddr_t addr);
+void dump_gpu_p2m_lookup(struct domain *d, paddr_t addr);
+
 static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain)
 {
 	u32 reg;
@@ -1107,7 +1110,19 @@ static void arm_smmu_init_context_bank(struct arm_smmu_domain *smmu_domain)
 	/* TTBR0 */
 	/* Xen: The page table is shared with the P2M code */
 	ASSERT(smmu_domain->cfg.domain != NULL);
-	p2maddr = page_to_maddr(smmu_domain->cfg.domain->arch.p2m.root);
+
+	/* Assign separate p2m's for HDLCD/GPU. Hardcoded for Juno board. */
+	if (dt_node_path_is_equal(dev_to_dt(smmu->dev), "/iommu@7fb10000")) {
+		PRINTK0("HDLCD1 SMMU detected, using display P2M\n");
+		p2maddr = page_to_maddr(smmu_domain->cfg.domain->arch.display_p2m.root);
+	} else if (dt_node_path_is_equal(dev_to_dt(smmu->dev), "/iommu@2b400000")) {
+		PRINTK0("GPU SMMU detected, using gpu P2M\n");
+		p2maddr = page_to_maddr(smmu_domain->cfg.domain->arch.gpu_p2m.root);
+
+	} else {
+		PRINTK0("Using normal page tables\n");
+		p2maddr = page_to_maddr(smmu_domain->cfg.domain->arch.p2m.root);
+	}
 
 	dev_notice(smmu->dev, "d%u: p2maddr 0x%"PRIpaddr"\n",
 		   smmu_domain->cfg.domain->domain_id, p2maddr);
@@ -1304,7 +1319,6 @@ static void arm_smmu_destroy_domain_context(struct iommu_domain *domain)
 static int arm_smmu_domain_init(struct iommu_domain *domain)
 {
 	struct arm_smmu_domain *smmu_domain;
-
 	/*
 	 * Allocate the domain and initialise some of its data structures.
 	 * We can't really do anything meaningful until we've added a
@@ -1527,7 +1541,6 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 	struct arm_smmu_domain *smmu_domain = domain->priv;
 	struct arm_smmu_device *smmu, *dom_smmu;
 	struct arm_smmu_master_cfg *cfg;
-
 	smmu = find_smmu_for_device(dev);
 	if (!smmu) {
 		dev_err(dev, "cannot attach to SMMU, is it on the same bus?\n");
@@ -1538,7 +1551,6 @@ static int arm_smmu_attach_dev(struct iommu_domain *domain, struct device *dev)
 		dev_err(dev, "already attached to IOMMU domain\n");
 		return -EEXIST;
 	}
-
 	/*
 	 * Sanity check the domain. We don't support domains across
 	 * different SMMUs.
@@ -1917,17 +1929,14 @@ static int arm_smmu_add_device(struct device *dev)
 	struct iommu_group *group;
 	void (*releasefn)(void *) = NULL;
 	int ret;
-
 	smmu = find_smmu_for_device(dev);
 	if (!smmu)
 		return -ENODEV;
-
 	group = iommu_group_alloc();
 	if (IS_ERR(group)) {
 		dev_err(dev, "Failed to allocate IOMMU group\n");
 		return PTR_ERR(group);
 	}
-
 	if (dev_is_pci(dev)) {
 		struct pci_dev *pdev = to_pci_dev(dev);
 
@@ -1947,7 +1956,6 @@ static int arm_smmu_add_device(struct device *dev)
 		releasefn = __arm_smmu_release_pci_iommudata;
 	} else {
 		struct arm_smmu_master *master;
-
 		master = find_smmu_master(smmu, dev->of_node);
 		if (!master) {
 			ret = -ENODEV;
@@ -1956,7 +1964,6 @@ static int arm_smmu_add_device(struct device *dev)
 
 		cfg = &master->cfg;
 	}
-
 	iommu_group_set_iommudata(group, cfg, releasefn);
 	ret = iommu_group_add_device(group, dev);
 
@@ -2107,9 +2114,9 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 	unsigned long size;
 	void __iomem *gr0_base = ARM_SMMU_GR0(smmu);
 	u32 id;
-
-	dev_notice(smmu->dev, "probing hardware configuration...\n");
-	dev_notice(smmu->dev, "SMMUv%d with:\n", smmu->version);
+	
+	PRINTK0("probing hardware configuration...\n");
+	PRINTK0("SMMUv%d with:\n", smmu->version);
 
 	/* ID0 */
 	id = readl_relaxed(gr0_base + ARM_SMMU_GR0_ID0);
@@ -2128,28 +2135,28 @@ static int arm_smmu_device_cfg_probe(struct arm_smmu_device *smmu)
 
 	if (id & ID0_S1TS) {
 		smmu->features |= ARM_SMMU_FEAT_TRANS_S1;
-		dev_notice(smmu->dev, "\tstage 1 translation\n");
+		PRINTK0("\tstage 1 translation\n");
 	}
 
 	if (id & ID0_S2TS) {
 		smmu->features |= ARM_SMMU_FEAT_TRANS_S2;
-		dev_notice(smmu->dev, "\tstage 2 translation\n");
+		PRINTK0("\tstage 2 translation\n");
 	}
 
 	if (id & ID0_NTS) {
 		smmu->features |= ARM_SMMU_FEAT_TRANS_NESTED;
-		dev_notice(smmu->dev, "\tnested translation\n");
+		PRINTK0("\tnested translation\n");
 	}
 
 	if (!(smmu->features &
 		(ARM_SMMU_FEAT_TRANS_S1 | ARM_SMMU_FEAT_TRANS_S2))) {
-		dev_err(smmu->dev, "\tno translation support!\n");
+		PRINTK0("\tno translation support!\n");
 		return -ENODEV;
 	}
 
 	if (id & ID0_CTTW) {
 		smmu->features |= ARM_SMMU_FEAT_COHERENT_WALK;
-		dev_notice(smmu->dev, "\tcoherent table walk\n");
+		PRINTK0("\tcoherent table walk\n");
 	}
 
 	if (id & ID0_SMS) {
@@ -2289,7 +2296,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 	struct rb_node *node;
 	struct of_phandle_args masterspec;
 	int num_irqs, i, err;
-
 	smmu = devm_kzalloc(dev, sizeof(*smmu), GFP_KERNEL);
 	if (!smmu) {
 		dev_err(dev, "failed to allocate arm_smmu_device\n");
@@ -2314,7 +2320,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 		err = -ENODEV;
 		goto out_free;
 	}
-
 	num_irqs = 0;
 	while ((res = platform_get_resource(pdev, IORESOURCE_IRQ, num_irqs))) {
 		num_irqs++;
@@ -2328,7 +2333,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 		err = -ENODEV;
 		goto out_free;
 	}
-
 	smmu->irqs = devm_kzalloc(dev, sizeof(*smmu->irqs) * num_irqs,
 				  GFP_KERNEL);
 	if (!smmu->irqs) {
@@ -2336,7 +2340,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 		err = -ENOMEM;
 		goto out_free;
 	}
-
 	for (i = 0; i < num_irqs; ++i) {
 		int irq = platform_get_irq(pdev, i);
 
@@ -2347,11 +2350,9 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 		}
 		smmu->irqs[i] = irq;
 	}
-
 	err = arm_smmu_device_cfg_probe(smmu);
 	if (err)
 		return err;
-
 	i = 0;
 	smmu->masters = RB_ROOT;
 	while (!of_parse_phandle_with_args(dev->of_node, "mmu-masters",
@@ -2378,7 +2379,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 		err = -ENODEV;
 		goto out_put_masters;
 	}
-
 	for (i = 0; i < smmu->num_global_irqs; ++i) {
 		err = request_irq(smmu->irqs[i],
 				  arm_smmu_global_fault,
@@ -2391,7 +2391,6 @@ static int arm_smmu_device_dt_probe(struct platform_device *pdev)
 			goto out_free_irqs;
 		}
 	}
-
 	INIT_LIST_HEAD(&smmu->list);
 	spin_lock(&arm_smmu_devices_lock);
 	list_add(&smmu->list, &arm_smmu_devices);
@@ -2597,7 +2596,6 @@ static int arm_smmu_assign_dev(struct domain *d, u8 devfn,
 	struct iommu_domain *domain;
 	struct arm_smmu_xen_domain *xen_domain;
 	int ret = 0;
-
 	xen_domain = dom_iommu(d)->arch.priv;
 
 	if (!dev->archdata.iommu) {
@@ -2605,13 +2603,11 @@ static int arm_smmu_assign_dev(struct domain *d, u8 devfn,
 		if (!dev->archdata.iommu)
 			return -ENOMEM;
 	}
-
 	if (!dev_iommu_group(dev)) {
 		ret = arm_smmu_add_device(dev);
 		if (ret)
 			return ret;
 	}
-
 	spin_lock(&xen_domain->lock);
 
 	/*
@@ -2620,26 +2616,22 @@ static int arm_smmu_assign_dev(struct domain *d, u8 devfn,
 	 */
 	domain = arm_smmu_get_domain(d, dev);
 	if (!domain) {
-
 		domain = xzalloc(struct iommu_domain);
 		if (!domain) {
 			ret = -ENOMEM;
 			goto out;
 		}
-
 		ret = arm_smmu_domain_init(domain);
 		if (ret) {
 			xfree(domain);
 			goto out;
 		}
-
 		domain->priv->cfg.domain = d;
 
 		/* Chain the new context to the domain */
 		list_add(&domain->list, &xen_domain->contexts);
 
 	}
-
 	ret = arm_smmu_attach_dev(domain, dev);
 	if (ret) {
 		if (domain->ref.counter == 0)
@@ -2647,7 +2639,6 @@ static int arm_smmu_assign_dev(struct domain *d, u8 devfn,
 	} else {
 		atomic_inc(&domain->ref);
 	}
-
 out:
 	spin_unlock(&xen_domain->lock);
 
@@ -2741,7 +2732,6 @@ static int __must_check arm_smmu_map_page(struct domain *d, unsigned long gfn,
 			unsigned long mfn, unsigned int flags)
 {
 	p2m_type_t t;
-
 	/*
 	 * Grant mappings can be used for DMA requests. The dev_bus_addr
 	 * returned by the hypercall is the MFN (not the IPA). For device
@@ -2812,7 +2802,6 @@ static __init int arm_smmu_dt_init(struct dt_device_node *dev,
 {
 	int rc;
 	const struct arm_smmu_device *smmu;
-
 	/*
 	 * Even if the device can't be initialized, we don't want to
 	 * give the SMMU device to dom0.

@@ -74,6 +74,10 @@
 #define MB(_mb)     (_AC(_mb, ULL) << 20)
 #define GB(_gb)     (_AC(_gb, ULL) << 30)
 
+#define PRINTK0(fmt, args...)  printk("%s: " fmt, __func__, ##args)
+#define PRINTK1(fmt, args...)  printk("%s: " fmt, __func__, ##args)
+#define PRINTK_ERR(fmt, args...)  printk("%s: " fmt, __func__, ##args)
+
 #define IS_ALIGNED(val, align) (((val) & ((align) - 1)) == 0)
 
 #define __STR(...) #__VA_ARGS__

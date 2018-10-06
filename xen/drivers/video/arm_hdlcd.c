@@ -117,6 +117,9 @@ void __init video_init(void)
     u32 lenp;
     int res;
 
+    PRINTK0("Do not allow Xen to use hdlcd so dom0 can use it.\n");
+    return;
+
     dev = dt_find_compatible_node(NULL, NULL, "arm,hdlcd");
 
     if ( !dev )

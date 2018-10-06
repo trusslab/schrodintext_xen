@@ -223,16 +223,13 @@ int iommu_construct(struct domain *d)
 {
     if ( need_iommu(d) > 0 )
         return 0;
-
     if ( !iommu_use_hap_pt(d) )
     {
         int rc;
-
         rc = arch_iommu_populate_page_table(d);
         if ( rc )
             return rc;
     }
-
     d->need_iommu = 1;
     /*
      * There may be dirty cache lines when a device is assigned

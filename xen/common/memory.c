@@ -28,10 +28,24 @@
 #include <asm/p2m.h>
 #include <public/memory.h>
 #include <xsm/xsm.h>
+#include <asm-arm/smccc.h>
+#include <xen/vmap.h>
 
 #ifdef CONFIG_X86
 #include <asm/guest.h>
 #endif
+
+#include <xen/delay.h>
+#include <xen/time.h>
+
+#define kmalloc(size, flags)      _xmalloc(size, sizeof(void *))
+#define kmalloc2(size)            xzalloc_bytes(size)
+
+#define kfree xfree
+#define kzalloc(size, flags)		_xzalloc(size, sizeof(void *))
+
+void schrodintext_change_page_permission(struct domain *d, paddr_t addr,
+						int log_type, int op);
 
 struct memop_args {
     /* INPUT */
@@ -969,6 +983,576 @@ static long xatp_permission_check(struct domain *d, unsigned int space)
     return xsm_add_to_physmap(XSM_TARGET, current->domain, d);
 }
 
+lpae_t _schrobuf_hide_page(struct p2m_domain *p2m, paddr_t addr, lpae_t white_pte);
+void p2m_flush_tlb(struct p2m_domain *p2m);
+
+lpae_t mfn_to_p2m_entry(mfn_t mfn, p2m_type_t t, p2m_access_t a);
+
+lpae_t schrobuf_hide_page(struct domain *d, paddr_t gpaddr, lpae_t pte)
+{
+    struct p2m_domain *p2m = &d->arch.p2m;
+	int ret;
+	lpae_t orig_pte;
+        
+	orig_pte = _schrobuf_hide_page(p2m, gpaddr, pte);
+
+	p2m_flush_tlb(p2m);
+	ret = iommu_iotlb_flush(d, gpaddr >> PAGE_SHIFT, 1);
+	
+	if (ret)
+		PRINTK0("Warning: IOMMU_IOTLB flush failed (ret = %d)\n", ret);
+		
+	return orig_pte;
+	
+}
+
+void _schrobuf_unhide_page(struct p2m_domain *p2m, paddr_t gpaddr, lpae_t orig_pte);
+
+void schrobuf_unhide_page(struct domain *d, paddr_t gpaddr, lpae_t orig_pte)
+{
+	struct p2m_domain *p2m = &d->arch.p2m;
+	int ret;
+	
+	_schrobuf_unhide_page(p2m, gpaddr, orig_pte);
+	
+	p2m_flush_tlb(p2m);
+	ret = iommu_iotlb_flush(d, gpaddr >> PAGE_SHIFT, 1);
+	
+	if (ret)
+		PRINTK0("Warning: IOMMU_IOTLB flush failed (ret = %d)\n", ret);
+}
+
+mfn_t display_p2m_lookup(struct domain *d, gfn_t gfn, p2m_type_t *t);
+
+static unsigned long get_secondary_mapping(struct domain *d, unsigned long gpaddr)
+{
+	mfn_t mfn;
+
+	// display_p2m always retains the correct mapping, albeit as read-only
+	mfn = display_p2m_lookup(d, gaddr_to_gfn(gpaddr), NULL);
+	
+    if ( INVALID_PADDR == mfn ) {
+	    PRINTK_ERR("Error: p2m_lookup failed\n");
+            return -ESRCH;
+	}
+
+    if ( !mfn_valid(mfn) ) {
+		PRINTK_ERR("Error: invalid mfn\n");
+        	return -EINVAL;
+	}
+
+	return (unsigned long) map_domain_page(_mfn(mfn));
+}
+
+enum SCHROBUF_PAGE_STATE {
+	SCHROBUF_MODIFIED = 0,
+	SCHROBUF_SHARED = 1,
+	SCHROBUF_INVALID = 2
+};
+
+int schrobuf_change_page_state(unsigned long gpaddr, int state)
+{
+	int ret;
+
+	switch (state) {
+		
+	case SCHROBUF_SHARED:
+		schrodintext_change_page_permission(current->domain, gpaddr,
+					XEN_PG_PERM_LOG_TYPE_W, XEN_PG_PERM_START);
+		break;
+		
+	case SCHROBUF_MODIFIED:
+		schrodintext_change_page_permission(current->domain, gpaddr,
+					XEN_PG_PERM_LOG_TYPE_RW, XEN_PG_PERM_STOP);
+		break;		
+		
+	case SCHROBUF_INVALID:
+		schrodintext_change_page_permission(current->domain, gpaddr,
+					XEN_PG_PERM_LOG_TYPE_RW, XEN_PG_PERM_START);
+		break;
+		
+	default:
+		PRINTK_ERR("Error: unknown state.\n");
+		break;
+	}
+
+	/* Note that the schrodintext_change_page_permission() does the CPU MMU flush already */
+	ret = iommu_iotlb_flush(current->domain, gpaddr >> PAGE_SHIFT, 1);
+	PRINTK0("ret = %d\n", ret);
+
+	return 0;
+}
+
+struct protected_page {
+	unsigned long orig_addr;
+	unsigned long page_addr;
+	unsigned long secondary_addr;
+	unsigned long replace_addr;
+	unsigned int num_pbufs;
+	lpae_t orig_pte;
+	struct list_head list;
+};
+
+struct protected_buf {
+	unsigned long off;
+	unsigned int size;
+	struct protected_page *ppage;
+	struct list_head list;
+};
+
+struct schrobuf {
+	unsigned long buffers_mem;
+	unsigned int num_buffers;
+	unsigned int buffer_size;
+	void *encrypted_text;
+	unsigned int text_len;
+	unsigned int text_buf_size;
+	unsigned long handle;
+	struct list_head pbufs;
+	struct list_head list;
+};
+
+/* We need to maintain a list per guest */
+struct list_head g_schrobufs;
+
+/* We need to maintain a list per guest process (mm) */
+struct list_head g_ppages;
+
+static void add_schrobuf(struct schrobuf *schrobuf)
+{
+	list_add(&schrobuf->list, &g_schrobufs);
+}
+
+static void *get_schrobuf(uint64_t handle)
+{
+	struct schrobuf *schrobuf = NULL, *s_tmp;
+
+	list_for_each_entry_safe(schrobuf, s_tmp, &g_schrobufs, list) {
+
+		if (schrobuf->handle == (unsigned long) handle) {
+			return schrobuf;
+		}
+	}
+
+	PRINTK_ERR("Didn't find the schrobuf\n");
+
+	return NULL;
+}
+
+static void remove_schrobuf(struct schrobuf *_schrobuf)
+{
+	struct schrobuf *schrobuf = NULL, *s_tmp;
+
+	if (!_schrobuf) {
+		PRINTK_ERR("Error: schrobuf is NULL\n");
+		return;
+	}
+
+	list_for_each_entry_safe(schrobuf, s_tmp, &g_schrobufs, list) {
+
+		if (schrobuf == _schrobuf) {
+			list_del(&schrobuf->list);
+			break;
+		}
+	}
+}
+// Sample hardcoded text:        M   Y       S   S   N      =        1   2   3   -  1    2  -   0   1   2    3  
+//unsigned int ascii_vals[20] = {77, 89, 32, 83, 83, 78, 32, 61, 32, 49, 50, 51, 45, 49, 50, 45, 48, 49, 50, 51};
+static void* schrobuf_decrypted_text = NULL;
+
+/* ASCII Codes for conditional character */
+#define SPACE_CHAR 32
+#define DASH_CHAR 45
+
+static void __user *get_resolve_addr(struct schrobuf *schrobuf, unsigned int text_pos, bool conditional_char)
+{
+	unsigned int next_char;
+	unsigned int text_len = schrobuf->text_len;
+	
+	if (!schrobuf_decrypted_text) {
+		PRINTK0("Error: text was never decrypted.\n");
+		next_char = SPACE_CHAR; // just render space since schrobuf_resolve expects something to render from this function
+		goto resolve;
+	}
+	
+	next_char = (unsigned int) ((unsigned char*) schrobuf_decrypted_text)[text_pos % text_len];	// modulo function to prevent going out of bounds for now
+	//next_char = ascii_vals[text_pos % text_len]; // Uncomment this and ascii_vals above if want to test hardcoded text; comment out above statement
+	
+	/* If conditional_char is set, we are either rendering the last character 
+	 * that can fit on one line or the last character entirely.
+	 * Determine which case it is.
+	*/
+	if (conditional_char) {
+		/* If we are not rendering the last character, then we render a conditional character 
+		 * because we are at the end of a line. Look at current character requested 
+		 * to be rendered. If it is an alphabetic character (A/a - Z/z), then render a dash (-) 
+		 * as the conditional character. Otherwise render a space ( ).
+		 * If we are rendering the last character, then we have enough space to fit it.
+		 * Don't render conditional character in that case and just render actual character.
+		 */
+		if (text_pos != (text_len - 1)) { // if we are not rendering the last character index
+			if ( (next_char >= 65 && next_char <= 90) || (next_char >= 97 && next_char <= 122) )
+				next_char = DASH_CHAR;
+			else
+				next_char = SPACE_CHAR;
+		}
+	}
+	
+resolve:
+	next_char -= 32; /* Glyphbook starts at 32 on the ASCII table because ASCII codes for 0-31 are non visible characters. */
+
+	if (next_char >= schrobuf->num_buffers) {
+		PRINTK0("Something went wrong, requested character is outside glyphbook.\n");
+		next_char = 0; // render space instead
+	}
+	
+	return (void __user *) (schrobuf->buffers_mem + (next_char * schrobuf->buffer_size));
+}
+
+static void add_ppage(struct protected_page *ppage)
+{
+	list_add(&ppage->list, &g_ppages);
+}
+
+static void add_pbuf(struct schrobuf *schrobuf, struct protected_buf *pbuf)
+{
+	list_add(&pbuf->list, &schrobuf->pbufs);
+}
+
+static void get_ppage_pbuf(struct schrobuf *schrobuf, unsigned long addr,
+			   struct protected_page **ppage_ptr, struct protected_buf **pbuf_ptr)
+{
+	struct protected_page *ppage = NULL, *p_tmp;
+	struct protected_buf *pbuf = NULL, *b_tmp;
+	unsigned long page_addr, off;
+	
+	*ppage_ptr = NULL;
+	*pbuf_ptr = NULL;
+
+	if (!schrobuf) {
+		PRINTK_ERR("Error: schrobuf is NULL\n");
+		return;
+	}
+
+	page_addr = addr & PAGE_MASK;
+	list_for_each_entry_safe(ppage, p_tmp, &g_ppages, list) {
+
+		if (ppage->page_addr == page_addr) {
+			*ppage_ptr = ppage;
+			break;
+			}
+	}
+
+	if (!*ppage_ptr)
+		return;
+
+	off = addr & ~PAGE_MASK;
+
+	list_for_each_entry_safe(pbuf, b_tmp, &schrobuf->pbufs, list) {
+
+		if (pbuf->off == off) {
+			*pbuf_ptr = pbuf;
+			break;
+		}
+	}
+
+	return;
+}
+
+static void remove_ppage(struct protected_page *_ppage)
+{
+	struct protected_page *ppage = NULL, *p_tmp;
+
+	list_for_each_entry_safe(ppage, p_tmp, &g_ppages, list) {
+
+		if (ppage == _ppage) {
+			list_del(&ppage->list);
+			kfree(ppage);
+			break;
+		}
+	}
+}
+
+static void clean_remove_ppage(struct protected_page *ppage)
+{
+	if (!ppage) {
+		PRINTK_ERR("Error: ppage is NULL\n");
+		return;
+	}
+
+	ppage->num_pbufs--;
+
+	if (ppage->num_pbufs == 0) {
+        unmap_domain_page_global((void *) ppage->secondary_addr);
+		schrobuf_unhide_page(current->domain, ppage->orig_addr, ppage->orig_pte);
+		list_del(&ppage->list);
+		kfree(ppage);
+	}
+}
+
+static void clean_remove_pbufs(struct schrobuf *schrobuf)
+{
+	struct protected_buf *pbuf = NULL, *b_tmp;
+
+	if (!schrobuf) {
+		PRINTK_ERR("Error: schrobuf is NULL\n");
+		return;
+	}
+
+	list_for_each_entry_safe(pbuf, b_tmp, &schrobuf->pbufs, list) {
+
+		/* We zero out the protected memory bufs before mapping them back */
+		memset((void *) (pbuf->ppage->secondary_addr + pbuf->off), 0x00, pbuf->size);
+		clean_remove_ppage(pbuf->ppage);
+		list_del(&pbuf->list);
+		kfree(pbuf);
+	}
+}
+
+// Shared memory between OP-TEE
+static void __iomem *shared_buf;
+
+static void schrobuf_decrypt(void* encrypted_text, unsigned int text_len, unsigned int text_buf_size) 
+{
+	struct arm_smccc_res res;
+
+	if (!schrobuf_decrypted_text) {
+		schrobuf_decrypted_text = _xmalloc(text_len, sizeof(void*));
+		
+		if (!schrobuf_decrypted_text) {
+			PRINTK_ERR("Could not allocate memory for decrypted_text! encrypted_text = 0x%p", encrypted_text);
+			return;
+		}
+		memset(schrobuf_decrypted_text, 0, text_len);
+
+		// Map shared memory into Xen - address/size hardcoded for now
+		shared_buf = ioremap_cache(0xfee00000, 0x1000);
+		// Copy encrypted_text to shared memory
+		memcpy(shared_buf, encrypted_text, text_buf_size);
+		// Perform SMC to decrypt text
+		arm_smccc_1_1_smc(OPTEE_SMC_SCHRODTEXT_DECRYPT, text_buf_size, text_len, 0, &res);
+		memcpy(schrobuf_decrypted_text, shared_buf, text_len);
+	}
+}
+
+static int schrobuf_register(struct xen_schrobuf_register_data data)
+{
+	struct schrobuf *schrobuf = NULL;
+	int ret;
+
+	schrobuf = kzalloc(sizeof(*schrobuf), GFP_KERNEL);
+	if (!schrobuf) {
+		PRINTK_ERR("Error: could not allocate memory for schrobuf\n");
+		return -ENOMEM;
+	}
+
+	schrobuf->handle = (unsigned long) data.handle;
+	schrobuf->buffers_mem = (unsigned long) data.buffers_mem;
+	schrobuf->num_buffers = (unsigned int) data.num_buffers;
+	schrobuf->buffer_size = (unsigned int) data.buffer_size;
+	schrobuf->text_len = (unsigned int) data.text_len;
+	schrobuf->text_buf_size = (unsigned int) data.text_buf_size;
+
+	schrobuf->encrypted_text = kmalloc(schrobuf->text_buf_size, GFP_KERNEL);
+	if (!schrobuf->encrypted_text) {
+		PRINTK_ERR("Error: could not allocate memory for encrypted text\n");
+		kfree(schrobuf);
+		return -ENOMEM;
+	}
+
+	ret = raw_copy_from_guest((void *) schrobuf->encrypted_text,
+        			  (void * __user) data.encrypted_text, schrobuf->text_buf_size);
+	if (ret) {
+		PRINTK_ERR("schrobuf_register Error: could not copy the encrypted text; ret = %d\n", (int) ret);
+		kfree(schrobuf->encrypted_text);
+		kfree(schrobuf);
+		return -EFAULT;
+	}
+	// Secure Monitor Call to OP-TEE to decrypt text and get shared memory setup between Xen and secure world
+	schrobuf_decrypt(schrobuf->encrypted_text, schrobuf->text_len, schrobuf->text_buf_size);
+
+	INIT_LIST_HEAD(&schrobuf->pbufs);
+	add_schrobuf(schrobuf);
+
+	return 0;
+}
+
+static int schrobuf_unregister(struct xen_schrobuf_unregister_data data)
+{
+	struct schrobuf *schrobuf = get_schrobuf(data.handle);
+	if (!schrobuf) {
+		PRINTK_ERR("Error: schrobuf is NULL\n");
+		return -EINVAL;
+	}
+
+	if (schrobuf->encrypted_text)
+		kfree(schrobuf->encrypted_text);
+
+	clean_remove_pbufs(schrobuf);
+	remove_schrobuf(schrobuf);
+	kfree(schrobuf);
+	
+	if (schrobuf_decrypted_text) {
+		kfree(schrobuf_decrypted_text);
+		schrobuf_decrypted_text = NULL;	
+	}
+		
+	return 0;
+}
+
+static int schrobuf_create_page(struct domain *d, void **p, lpae_t *ptep)
+{
+    struct page_info *page;
+    struct p2m_domain *p2m = &d->arch.p2m;
+    
+    page = alloc_domheap_page(NULL, 0);
+    if ( page == NULL ) {
+		PRINTK_ERR("Error: could not allocate a page\n");
+        return -ENOMEM;
+    }
+
+    *p = __map_domain_page(page);
+
+    *ptep = mfn_to_p2m_entry(page_to_mfn(page), p2m_ram_rw,
+                           p2m->default_access);
+    return 0;
+}
+
+static int schrobuf_blend(uint8_t *dst_addr, uint8_t *src_addr, int size) 
+{    
+    int i;
+    int br, bg, bb, ba, fr, fg, fb, fa;
+    for (i = 0; i < size; i += 4) {
+           br = dst_addr[i];
+           bg = dst_addr[i + 1];
+           bb = dst_addr[i + 2];
+           ba = dst_addr[i + 3];
+
+           fr = src_addr[i];
+           fg = src_addr[i + 1];
+           fb = src_addr[i + 2];
+           fa = src_addr[i + 3];
+
+           dst_addr[i] = (uint8_t) (((fr * fa) + (br * (255 - fa))) / 255);
+           dst_addr[i + 1] = (uint8_t) (((fg * fa) + (bg * (255 - fa))) / 255);
+           dst_addr[i + 2] = (uint8_t) (((fb * fa) + (bb * (255 - fa))) / 255);
+           dst_addr[i + 3] = 0xFF;
+    }
+    
+    return 0;
+} 
+
+static int schrobuf_resolve(struct xen_schrobuf_resolve_data data)
+{
+	struct protected_buf *pbuf = NULL;
+	struct protected_page *ppage = NULL;
+	bool ppage_allocated = false;
+	void *resolve_dst_addr, __user *resolve_src_addr, *replace_addr = NULL,
+							*glyph_buffer = NULL;
+	unsigned long secondary_addr;
+	struct schrobuf *schrobuf = get_schrobuf(data.handle);
+	int ret;
+	lpae_t pte;
+
+	if (!schrobuf) {
+		PRINTK_ERR("Error: schrobuf is NULL\n");
+		return -EINVAL;
+	} 
+
+	if ((data.dst_paddr & ~PAGE_MASK) + schrobuf->buffer_size >= PAGE_SIZE) {
+		PRINTK_ERR("Error: dst buff goes across page boundary.\n");
+		return -EINVAL;
+	}
+
+	get_ppage_pbuf(schrobuf, data.dst_paddr, &ppage, &pbuf);
+
+	glyph_buffer = kmalloc(schrobuf->buffer_size, GFP_KERNEL);
+	if (!glyph_buffer) {
+		PRINTK_ERR("Error: could not allocate memory for glyph_buffer.\n");
+		return -ENOMEM;
+	}
+
+	if (pbuf)
+		goto pbuf_ready;
+
+	if (ppage) {
+		ppage_allocated = true;
+		goto ppage_ready;
+	}
+
+	ppage = kzalloc(sizeof(*ppage), GFP_KERNEL);
+	if (!ppage) {
+		PRINTK_ERR("Error: could not allocate memory for ppage\n");
+		return -ENOMEM;
+	}
+
+	ret = schrobuf_create_page(current->domain, &replace_addr, &pte);
+	if (ret) {
+		PRINTK_ERR("Error: could not map the page in secondary addr\n");
+		return -EFAULT;
+	}
+	
+	ppage->orig_pte = schrobuf_hide_page(current->domain, data.dst_paddr, pte);
+	ppage->orig_addr = (unsigned long) data.dst_paddr;	// save the first physical addr we get that corresponds to this page
+	ppage->page_addr = (unsigned long) data.dst_paddr & PAGE_MASK;
+	add_ppage(ppage);
+	secondary_addr = get_secondary_mapping(current->domain, data.dst_paddr);
+
+	if (!secondary_addr) {
+		PRINTK_ERR("Error: could not map the page in secondary addr\n");
+		schrobuf_unhide_page(current->domain, data.dst_paddr, ppage->orig_pte);
+		remove_ppage(ppage);
+		return -EFAULT;
+	}
+
+	memcpy(replace_addr, (void *) secondary_addr, PAGE_SIZE);
+    clean_dcache_va_range(replace_addr, PAGE_SIZE);
+
+	ppage->secondary_addr = (unsigned long) secondary_addr;
+	ppage->replace_addr = (unsigned long) replace_addr;
+ppage_ready:
+	pbuf = kzalloc(sizeof(*pbuf), GFP_KERNEL);
+	if (!pbuf) {
+		PRINTK_ERR("Error: could not allocate memory for pbuf\n");
+		if (!ppage_allocated) {
+			schrobuf_unhide_page(current->domain, data.dst_paddr, ppage->orig_pte);
+			remove_ppage(ppage);
+		}
+		return -ENOMEM;
+	}
+
+	pbuf->off = data.dst_paddr & ~PAGE_MASK;
+	pbuf->size = schrobuf->buffer_size;
+	pbuf->ppage = ppage;
+	ppage->num_pbufs++;
+	add_pbuf(schrobuf, pbuf);
+
+pbuf_ready:
+	resolve_dst_addr = (void *) (ppage->secondary_addr + pbuf->off);
+	resolve_src_addr = get_resolve_addr(schrobuf, data.text_pos, data.conditional_char);
+	
+	ret = raw_copy_from_guest(glyph_buffer, resolve_src_addr, schrobuf->buffer_size);
+	if (ret)
+		PRINTK0("Could not make the resolution.\n");
+	else { /* Successful resolution. Composite text. */
+		schrobuf_blend(resolve_dst_addr, glyph_buffer, schrobuf->buffer_size);
+    	clean_and_invalidate_dcache_va_range((void *) ppage->secondary_addr, PAGE_SIZE);
+	}
+	kfree(glyph_buffer);
+
+	return 0;
+}
+
+bool schrobuf_initialized = false;
+
+static void init_schrobuf_framework(struct domain *d)
+{
+    INIT_LIST_HEAD(&g_schrobufs);
+    INIT_LIST_HEAD(&g_ppages);
+
+    schrobuf_initialized = true;
+}
+
 long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 {
     struct domain *d, *curr_d = current->domain;
@@ -1423,6 +2007,63 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         break;
     }
 #endif
+
+    // SchrodinText hypercalls
+    case XENMEM_schrobuf_register:
+    {
+        struct xen_schrobuf_register_data data;
+      
+		if (!schrobuf_initialized) {
+		    init_schrobuf_framework(current->domain);
+		}
+ 
+		if ( copy_from_guest(&data,
+        		guest_handle_cast(arg, xen_schrobuf_register_data_t), 1) ) {
+	    	PRINTK_ERR( "XENMEM_schrobuf_register - could not copy from guest\n");
+            return -EFAULT;
+		}
+		
+   	 	rc = schrobuf_register(data); 
+		break;
+    }
+
+    case XENMEM_schrobuf_unregister:
+    {
+        struct xen_schrobuf_unregister_data data;
+	
+		if (!schrobuf_initialized) {
+	 	   PRINTK_ERR("Error: no previously registered schrobufs\n");
+	 	   return -EINVAL;
+		}
+       
+		if ( copy_from_guest(&data,
+     	   		guest_handle_cast(arg, xen_schrobuf_unregister_data_t), 1) ) {
+	  		 	PRINTK_ERR("Error: Could not copy data from guest\n");
+          	    return -EFAULT;
+		}
+
+        rc = schrobuf_unregister(data); 
+		break;
+    }
+
+    case XENMEM_schrobuf_resolve:
+    {
+        struct xen_schrobuf_resolve_data data;
+	
+		if (!schrobuf_initialized) {
+	    	PRINTK_ERR("Error: not previously registered schrobufs\n");
+	    	return -EINVAL;
+		}
+       
+		if ( copy_from_guest(&data,
+        		guest_handle_cast(arg, xen_schrobuf_resolve_data_t), 1) ) {
+	    	PRINTK_ERR("Error: Could not copy data from guest\n");
+            return -EFAULT; 
+		}
+
+        rc = schrobuf_resolve(data);
+		break;
+    }
 
     default:
         rc = arch_memory_op(cmd, arg);

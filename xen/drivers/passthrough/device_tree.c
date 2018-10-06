@@ -28,17 +28,18 @@ int iommu_assign_dt_device(struct domain *d, struct dt_device_node *dev)
 {
     int rc = -EBUSY;
     struct domain_iommu *hd = dom_iommu(d);
-
     if ( !iommu_enabled || !hd->platform_ops )
         return -EINVAL;
 
     if ( !dt_device_is_protected(dev) )
         return -EINVAL;
-
     spin_lock(&dtdevs_lock);
 
     if ( !list_empty(&dev->domain_list) )
         goto fail;
+
+    /* We want to use iommu for dom0 */
+    d->need_iommu = -1;
 
     if ( need_iommu(d) <= 0 )
     {
@@ -46,12 +47,10 @@ int iommu_assign_dt_device(struct domain *d, struct dt_device_node *dev)
          * The hwdom is forced to use IOMMU for protecting assigned
          * device. Therefore the IOMMU data is already set up.
          */
-        ASSERT(!is_hardware_domain(d));
         rc = iommu_construct(d);
         if ( rc )
             goto fail;
     }
-
     /* The flag field doesn't matter to DT device. */
     rc = hd->platform_ops->assign_device(d, 0, dt_to_dev(dev), 0);
 

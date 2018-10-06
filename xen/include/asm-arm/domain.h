@@ -49,6 +49,8 @@ struct arch_domain
 
     /* Virtual MMU */
     struct p2m_domain p2m;
+    struct p2m_domain display_p2m;
+    struct p2m_domain gpu_p2m;
 
     struct hvm_domain hvm_domain;
 

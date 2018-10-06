@@ -182,11 +182,12 @@ static inline void check_memory_layout_alignment_constraints(void) {
 #endif
 }
 
+const char *level_strs[4] = { "0TH", "1ST", "2ND", "3RD" };
+
 void dump_pt_walk(paddr_t ttbr, paddr_t addr,
                   unsigned int root_level,
                   unsigned int nr_root_tables)
 {
-    static const char *level_strs[4] = { "0TH", "1ST", "2ND", "3RD" };
     const mfn_t root_mfn = maddr_to_mfn(ttbr);
     const unsigned int offsets[4] = {
         zeroeth_table_offset(addr),
@@ -211,7 +212,205 @@ void dump_pt_walk(paddr_t ttbr, paddr_t addr,
          */
         BUG_ON(root_level == 0);
         root_table = offsets[root_level - 1];
-        printk("Using concatenated root table %u\n", root_table);
+        PRINTK1("Using concatenated root table %u\n", root_table);
+        if ( root_table >= nr_root_tables )
+        {
+            printk("Invalid root table offset\n");
+            return;
+        }
+    }
+    else
+        root_table = 0;
+
+    mapping = map_domain_page(mfn_add(root_mfn, root_table));
+
+    for ( level = root_level; ; level++ )
+    {
+        if ( offsets[level] > LPAE_ENTRIES )
+            break;
+
+        pte = mapping[offsets[level]];
+        PRINTK1("%s[0x%x] = 0x%"PRIpaddr"\n",
+               level_strs[level], offsets[level], pte.bits);
+
+        if ( level == 3 || !pte.walk.valid || !pte.walk.table )
+            break;
+
+        /* For next iteration */
+        unmap_domain_page(mapping);
+        mapping = map_domain_page(_mfn(pte.walk.base));
+    }
+
+    unmap_domain_page(mapping);
+}
+
+// Reused code from dump_pt_walk().
+void __schrodintext_change_page_permission(paddr_t ttbr, paddr_t addr,
+                  unsigned int root_level,
+                  unsigned int nr_root_tables,
+		  int log_type, int op)
+{
+    const unsigned long root_pfn = paddr_to_pfn(ttbr);
+    const unsigned int offsets[4] = {
+        zeroeth_table_offset(addr),
+        first_table_offset(addr),
+        second_table_offset(addr),
+        third_table_offset(addr)
+    };
+    lpae_t pte, *mapping;
+    unsigned int level, root_table;
+
+#ifdef CONFIG_ARM_32
+    BUG_ON(root_level < 1);
+#endif
+    BUG_ON(root_level > 3);
+
+    if ( nr_root_tables > 1 )
+    {
+        /*
+         * Concatenated root-level tables. The table number will be
+         * the offset at the previous level. It is not possible to
+         * concatenate a level-0 root.
+         */
+        BUG_ON(root_level == 0);
+        root_table = offsets[root_level - 1];
+        PRINTK1("Using concatenated root table %u\n", root_table);
+        if ( root_table >= nr_root_tables )
+        {
+            PRINTK1("Invalid root table offset\n");
+            return;
+        }
+    }
+    else
+        root_table = 0;
+
+    mapping = map_domain_page(_mfn(root_pfn + root_table));
+
+    for ( level = root_level; ; level++ )
+    {
+        if ( offsets[level] > LPAE_ENTRIES )
+            break;
+
+        pte = mapping[offsets[level]];
+
+		if (level == 3) {
+			if (op == XEN_PG_PERM_START) {
+        	    pte.p2m.write = 0;
+				if (log_type == XEN_PG_PERM_LOG_TYPE_RW) {
+					pte.p2m.read = 0;
+				}
+			} else { /* XEN_PG_PERM_STOP */
+            	pte.p2m.write = 1;
+				pte.p2m.read = 1;
+			}
+        	mapping[offsets[level]] = pte;
+		}
+
+    	if ( level == 3 || !pte.walk.valid || !pte.walk.table )
+    		break;
+
+        /* For next iteration */
+        unmap_domain_page(mapping);
+        mapping = map_domain_page(_mfn(pte.walk.base));
+    }
+
+    unmap_domain_page(mapping);
+}
+
+// Reused code from dump_pt_walk().
+lpae_t __schrobuf_hide_page(paddr_t ttbr, paddr_t addr,
+                  unsigned int root_level,
+                  unsigned int nr_root_tables,
+		  		  lpae_t white_pte)
+{
+    const mfn_t root_mfn = maddr_to_mfn(ttbr);
+    const unsigned int offsets[4] = {
+        zeroeth_table_offset(addr),
+        first_table_offset(addr),
+        second_table_offset(addr),
+        third_table_offset(addr)
+    };
+    lpae_t pte, orig_pte, *mapping;
+    unsigned int level, root_table;
+
+#ifdef CONFIG_ARM_32
+    BUG_ON(root_level < 1);
+#endif
+    BUG_ON(root_level > 3);
+
+    if ( nr_root_tables > 1 )
+    {
+        /*
+         * Concatenated root-level tables. The table number will be
+         * the offset at the previous level. It is not possible to
+         * concatenate a level-0 root.
+         */
+        BUG_ON(root_level == 0);
+        root_table = offsets[root_level - 1];
+        if ( root_table >= nr_root_tables )
+        {
+            printk("Invalid root table offset\n");
+            return white_pte;
+        }
+    }
+    else
+        root_table = 0;
+
+    mapping = map_domain_page(mfn_add(root_mfn, root_table));
+
+    for ( level = root_level; ; level++ )
+    {
+        if ( offsets[level] > LPAE_ENTRIES )
+            break;
+
+        pte = mapping[offsets[level]];
+
+		if (level == 3) {
+			orig_pte = pte;
+        	mapping[offsets[level]] = white_pte;
+		}
+
+        if ( level == 3 || !pte.walk.valid || !pte.walk.table )
+            break;
+
+        /* For next iteration */
+        unmap_domain_page(mapping);
+        mapping = map_domain_page(_mfn(pte.walk.base));
+    }
+
+    unmap_domain_page(mapping);
+    return orig_pte;
+}
+
+void __schrobuf_unhide_page(paddr_t ttbr, paddr_t addr,
+                  unsigned int root_level,
+                  unsigned int nr_root_tables,
+		  		  lpae_t orig_pte)
+{
+    const mfn_t root_mfn = maddr_to_mfn(ttbr);
+    const unsigned int offsets[4] = {
+        zeroeth_table_offset(addr),
+        first_table_offset(addr),
+        second_table_offset(addr),
+        third_table_offset(addr)
+    };
+    lpae_t pte, *mapping;
+    unsigned int level, root_table;
+
+#ifdef CONFIG_ARM_32
+    BUG_ON(root_level < 1);
+#endif
+    BUG_ON(root_level > 3);
+
+    if ( nr_root_tables > 1 )
+    {
+        /*
+         * Concatenated root-level tables. The table number will be
+         * the offset at the previous level. It is not possible to
+         * concatenate a level-0 root.
+         */
+        BUG_ON(root_level == 0);
+        root_table = offsets[root_level - 1];
         if ( root_table >= nr_root_tables )
         {
             printk("Invalid root table offset\n");
@@ -230,8 +429,9 @@ void dump_pt_walk(paddr_t ttbr, paddr_t addr,
 
         pte = mapping[offsets[level]];
 
-        printk("%s[0x%x] = 0x%"PRIpaddr"\n",
-               level_strs[level], offsets[level], pte.bits);
+		if (level == 3) {
+        	mapping[offsets[level]] = orig_pte;
+		}
 
         if ( level == 3 || !pte.walk.valid || !pte.walk.table )
             break;
@@ -1305,7 +1505,6 @@ int xenmem_add_to_physmap_one(
     default:
         return -ENOSYS;
     }
-
     /* Map at new location. */
     rc = guest_physmap_add_entry(d, gfn, mfn, 0, t);
 

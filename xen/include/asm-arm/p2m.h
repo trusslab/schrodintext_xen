@@ -9,6 +9,7 @@
 #include <public/memory.h>
 #include <xen/p2m-common.h>
 #include <public/memory.h>
+#include <xen/sched.h>
 
 #define paddr_bits PADDR_BITS
 
@@ -170,6 +171,9 @@ void p2m_teardown(struct domain *d);
  */
 int relinquish_p2m_mapping(struct domain *d);
 
+int display_p2m_alloc_table(struct domain *d);
+int gpu_p2m_alloc_table(struct domain *d);
+
 /* Context switch */
 void p2m_save_state(struct vcpu *p);
 void p2m_restore_state(struct vcpu *n);
@@ -255,6 +259,18 @@ int guest_physmap_add_entry(struct domain *d,
                             unsigned long page_order,
                             p2m_type_t t);
 
+int guest_display_physmap_add_entry(struct domain *d,
+                            unsigned long gfn,
+                            unsigned long mfn,
+                            unsigned long page_order,
+                            p2m_type_t t);
+
+int guest_gpu_physmap_add_entry(struct domain *d,
+                            unsigned long gfn,
+                            unsigned long mfn,
+                            unsigned long page_order,
+                            p2m_type_t t);
+
 /* Untyped version for RAM only, for compatibility */
 static inline int guest_physmap_add_page(struct domain *d,
                                          gfn_t gfn,
@@ -262,6 +278,22 @@ static inline int guest_physmap_add_page(struct domain *d,
                                          unsigned int page_order)
 {
     return guest_physmap_add_entry(d, gfn, mfn, page_order, p2m_ram_rw);
+}
+
+static inline int guest_display_physmap_add_page(struct domain *d,
+                                         gfn_t gfn,
+                                         mfn_t mfn,
+                                         unsigned int page_order)
+{
+    return guest_display_physmap_add_entry(d, gfn, mfn, page_order, p2m_iommu_map_ro);
+}
+
+static inline int guest_gpu_physmap_add_page(struct domain *d,
+                                         gfn_t gfn,
+                                         mfn_t mfn,
+                                         unsigned int page_order)
+{
+    return guest_gpu_physmap_add_entry(d, gfn, mfn, page_order, p2m_iommu_map_rw);
 }
 
 mfn_t gfn_to_mfn(struct domain *d, gfn_t gfn);

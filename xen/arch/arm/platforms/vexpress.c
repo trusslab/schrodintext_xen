@@ -161,7 +161,8 @@ static const struct dt_device_match vexpress_blacklist_dev[] __initconst =
     /* Video device
      * TODO: remove it once memreserve is handled properly by Xen
      */
-    DT_MATCH_COMPATIBLE("arm,hdlcd"),
+    // Ensure dom0 gets hdlcd.
+    //DT_MATCH_COMPATIBLE("arm,hdlcd"),
     /* Hardware power management */
     DT_MATCH_COMPATIBLE("arm,vexpress-reset"),
     DT_MATCH_COMPATIBLE("arm,vexpress-reboot"),

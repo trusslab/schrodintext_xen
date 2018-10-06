@@ -652,6 +652,64 @@ DEFINE_XEN_GUEST_HANDLE(xen_vnuma_topology_info_t);
 
 /* Next available subop number is 28 */
 
+#define XENMEM_schrobuf_register		37
+#define XENMEM_schrobuf_unregister	38
+#define XENMEM_schrobuf_resolve		39
+
+struct xen_pg_perm_data {
+    domid_t domid;
+    uint64_t    gpfn;
+#define XEN_PG_PERM_LOG_TYPE_W	0
+#define XEN_PG_PERM_LOG_TYPE_RW	1
+    uint8_t	log_type;
+#define XEN_PG_PERM_START	0
+#define XEN_PG_PERM_STOP	1
+    uint8_t	op;
+};
+typedef struct xen_pg_perm_data xen_pg_perm_data_t;
+DEFINE_XEN_GUEST_HANDLE(xen_pg_perm_data_t);
+
+struct xen_log_buf {
+	int count;
+	int src_reg_index;
+	unsigned long dst_addr;
+	unsigned int gpfn;
+};
+typedef struct xen_log_buf xen_log_buf_t;
+DEFINE_XEN_GUEST_HANDLE(xen_log_buf_t);
+
+struct xen_smem_data {
+	unsigned long smem;
+};
+typedef struct xen_smem_data xen_smem_data_t;
+DEFINE_XEN_GUEST_HANDLE(xen_smem_data_t);
+
+struct xen_schrobuf_register_data {
+    uint64_t handle;
+    uint64_t buffers_mem;
+    uint32_t num_buffers;
+    uint32_t buffer_size;
+    uint64_t encrypted_text;
+    uint32_t text_len;
+    uint32_t text_buf_size;
+};
+typedef struct xen_schrobuf_register_data xen_schrobuf_register_data_t;
+DEFINE_XEN_GUEST_HANDLE(xen_schrobuf_register_data_t);
+
+struct xen_schrobuf_unregister_data {
+    uint64_t handle;
+};
+typedef struct xen_schrobuf_unregister_data xen_schrobuf_unregister_data_t;
+DEFINE_XEN_GUEST_HANDLE(xen_schrobuf_unregister_data_t);
+
+struct xen_schrobuf_resolve_data {
+    uint64_t handle;
+    uint64_t dst_paddr;
+    uint32_t text_pos;
+    bool conditional_char;
+};
+typedef struct xen_schrobuf_resolve_data xen_schrobuf_resolve_data_t;
+DEFINE_XEN_GUEST_HANDLE(xen_schrobuf_resolve_data_t);
 #endif /* __XEN_PUBLIC_MEMORY_H__ */
 
 /*
