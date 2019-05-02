@@ -692,6 +692,8 @@ struct xen_schrobuf_register_data {
     uint64_t encrypted_text;
     uint32_t text_len;
     uint32_t text_buf_size;
+	uint64_t char_widths;
+	uint32_t char_widths_size;
 };
 typedef struct xen_schrobuf_register_data xen_schrobuf_register_data_t;
 DEFINE_XEN_GUEST_HANDLE(xen_schrobuf_register_data_t);
@@ -703,10 +705,14 @@ typedef struct xen_schrobuf_unregister_data xen_schrobuf_unregister_data_t;
 DEFINE_XEN_GUEST_HANDLE(xen_schrobuf_unregister_data_t);
 
 struct xen_schrobuf_resolve_data {
-    uint64_t handle;
-    uint64_t dst_paddr;
-    uint32_t text_pos;
-    bool conditional_char;
+	uint64_t handle;
+	uint64_t dst_paddr;
+	uint32_t text_pos;
+	uint32_t px;
+	uint32_t fb_bytespp;
+	bool conditional_char;
+	bool trust_addr;
+	bool last_res;
 };
 typedef struct xen_schrobuf_resolve_data xen_schrobuf_resolve_data_t;
 DEFINE_XEN_GUEST_HANDLE(xen_schrobuf_resolve_data_t);

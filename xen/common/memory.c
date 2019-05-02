@@ -1156,58 +1156,6 @@ static void remove_schrobuf(struct schrobuf *_schrobuf)
 		}
 	}
 }
-// Sample hardcoded text:        M   Y       S   S   N      =        1   2   3   -  1    2  -   0   1   2    3  
-//unsigned int ascii_vals[20] = {77, 89, 32, 83, 83, 78, 32, 61, 32, 49, 50, 51, 45, 49, 50, 45, 48, 49, 50, 51};
-static void* schrobuf_decrypted_text = NULL;
-
-/* ASCII Codes for conditional character */
-#define SPACE_CHAR 32
-#define DASH_CHAR 45
-
-static void __user *get_resolve_addr(struct schrobuf *schrobuf, unsigned int text_pos, bool conditional_char)
-{
-	unsigned int next_char;
-	unsigned int text_len = schrobuf->text_len;
-	
-	if (!schrobuf_decrypted_text) {
-		PRINTK0("Error: text was never decrypted.\n");
-		next_char = SPACE_CHAR; // just render space since schrobuf_resolve expects something to render from this function
-		goto resolve;
-	}
-	
-	next_char = (unsigned int) ((unsigned char*) schrobuf_decrypted_text)[text_pos % text_len];	// modulo function to prevent going out of bounds for now
-	//next_char = ascii_vals[text_pos % text_len]; // Uncomment this and ascii_vals above if want to test hardcoded text; comment out above statement
-	
-	/* If conditional_char is set, we are either rendering the last character 
-	 * that can fit on one line or the last character entirely.
-	 * Determine which case it is.
-	*/
-	if (conditional_char) {
-		/* If we are not rendering the last character, then we render a conditional character 
-		 * because we are at the end of a line. Look at current character requested 
-		 * to be rendered. If it is an alphabetic character (A/a - Z/z), then render a dash (-) 
-		 * as the conditional character. Otherwise render a space ( ).
-		 * If we are rendering the last character, then we have enough space to fit it.
-		 * Don't render conditional character in that case and just render actual character.
-		 */
-		if (text_pos != (text_len - 1)) { // if we are not rendering the last character index
-			if ( (next_char >= 65 && next_char <= 90) || (next_char >= 97 && next_char <= 122) )
-				next_char = DASH_CHAR;
-			else
-				next_char = SPACE_CHAR;
-		}
-	}
-	
-resolve:
-	next_char -= 32; /* Glyphbook starts at 32 on the ASCII table because ASCII codes for 0-31 are non visible characters. */
-
-	if (next_char >= schrobuf->num_buffers) {
-		PRINTK0("Something went wrong, requested character is outside glyphbook.\n");
-		next_char = 0; // render space instead
-	}
-	
-	return (void __user *) (schrobuf->buffers_mem + (next_char * schrobuf->buffer_size));
-}
 
 static void add_ppage(struct protected_page *ppage)
 {
@@ -1309,6 +1257,12 @@ static void clean_remove_pbufs(struct schrobuf *schrobuf)
 	}
 }
 
+static void* schrobuf_decrypted_text = NULL;
+static unsigned int* schrobuf_char_widths = NULL;
+
+/* ASCII Codes for conditional character */
+#define SPACE_CHAR 32
+#define DASH_CHAR 45
 // Shared memory between OP-TEE
 static void __iomem *shared_buf;
 
@@ -1333,6 +1287,23 @@ static void schrobuf_decrypt(void* encrypted_text, unsigned int text_len, unsign
 		arm_smccc_1_1_smc(OPTEE_SMC_SCHRODTEXT_DECRYPT, text_buf_size, text_len, 0, &res);
 		memcpy(schrobuf_decrypted_text, shared_buf, text_len);
 	}
+}
+
+static int schrobuf_get_char_widths(unsigned long char_widths, unsigned int char_widths_size) 
+{
+	schrobuf_char_widths = xmalloc_array(unsigned int, char_widths_size);
+	
+	if (!schrobuf_char_widths) {
+		PRINTK_ERR("Could not allocate memory for schrobuf_char_widths\n");
+		return -ENOMEM;
+	}
+
+	if (raw_copy_from_guest((void *) schrobuf_char_widths, (void * __user) char_widths, char_widths_size * sizeof(int))) {
+		PRINTK_ERR("Could not copy char_widths from guest");
+		return -EFAULT;
+	}
+	
+	return 0;
 }
 
 static int schrobuf_register(struct xen_schrobuf_register_data data)
@@ -1371,6 +1342,10 @@ static int schrobuf_register(struct xen_schrobuf_register_data data)
 	// Secure Monitor Call to OP-TEE to decrypt text and get shared memory setup between Xen and secure world
 	schrobuf_decrypt(schrobuf->encrypted_text, schrobuf->text_len, schrobuf->text_buf_size);
 
+	if (!schrobuf_char_widths && data.char_widths) {
+		schrobuf_get_char_widths(data.char_widths, data.char_widths_size);
+	}
+
 	INIT_LIST_HEAD(&schrobuf->pbufs);
 	add_schrobuf(schrobuf);
 
@@ -1395,6 +1370,10 @@ static int schrobuf_unregister(struct xen_schrobuf_unregister_data data)
 	if (schrobuf_decrypted_text) {
 		kfree(schrobuf_decrypted_text);
 		schrobuf_decrypted_text = NULL;	
+	}
+	if (schrobuf_char_widths) {
+		kfree(schrobuf_char_widths);
+		schrobuf_char_widths = NULL;
 	}
 		
 	return 0;
@@ -1440,7 +1419,99 @@ static int schrobuf_blend(uint8_t *dst_addr, uint8_t *src_addr, int size)
     }
     
     return 0;
-} 
+}
+// Sample hardcoded text:       M   Y       S   S   N      =        1   2   3   -  1    2  -   0   1   2    3  
+//unsigned int ascii_vals[20] = {77, 89, 32, 83, 83, 78, 32, 61, 32, 49, 50, 51, 45, 49, 50, 45, 48, 49, 50, 51};
+
+static bool schrobuf_line_start = false;	// false if we have not resolved anything yet on current line of text, true otherwise
+static unsigned int schrobuf_current_px = 0;			// the current x coordinate as seen by Xen
+static unsigned int schrobuf_current_text_pos = 0;		// it is ok to init at 0 because schrobuf_line_start dictates whether or not this value is valid
+static int schrobuf_addr_adjustment = 0;	// adjust the data.dst_addr to move rendered text, may be negative
+
+static void schrobuf_adjust_reset(void) {
+	schrobuf_line_start = false;
+	schrobuf_current_px = 0;
+	schrobuf_current_text_pos = 0;
+	schrobuf_addr_adjustment = 0;
+	if (schrobuf_char_widths) {
+		kfree(schrobuf_char_widths);
+		schrobuf_char_widths = NULL;
+	}
+}
+
+// Performs adjustment as needed to ensure text appears aesthetically proper (needed only for non monospaced fonts)
+// Xen adjusts only on x-axis, it assumes OS can properly layout on the y-axis
+static void schrobuf_adjust(struct xen_schrobuf_resolve_data *data)
+{
+	int curr_char;
+	
+	if (!schrobuf_line_start) {
+		schrobuf_current_px = data->px;
+		schrobuf_current_text_pos = data->text_pos;
+		schrobuf_line_start = true;
+	}
+
+	// We have finished resolving the previous text position
+	if (data->text_pos != schrobuf_current_text_pos) {
+		curr_char = (unsigned int) ((unsigned char*) schrobuf_decrypted_text)[schrobuf_current_text_pos];
+		schrobuf_current_px += schrobuf_char_widths[(curr_char - 32)];
+		//schrobuf_current_px += schrobuf_char_widths[(ascii_vals[schrobuf_current_text_pos]-32)];	// uncomment this and comment out above two and "int curr_char;" to use hard-coded text
+		schrobuf_current_text_pos = data->text_pos;
+		schrobuf_addr_adjustment = (schrobuf_current_px - data->px) * data->fb_bytespp;
+	} 
+
+	data->dst_paddr += schrobuf_addr_adjustment;
+
+	// Reset on the last resolve for the last char in the current line
+	if (data->conditional_char && data->last_res) {
+		schrobuf_adjust_reset();
+	}
+}
+
+static void __user *get_resolve_addr(struct schrobuf *schrobuf, unsigned int text_pos, bool conditional_char)
+{
+	unsigned int next_char;
+	unsigned int text_len = schrobuf->text_len;
+	
+	if (!schrobuf_decrypted_text) {
+		PRINTK0("Error: text was never decrypted.\n");
+		next_char = SPACE_CHAR; // just render space since schrobuf_resolve expects something to render from this function
+		goto resolve;
+	}
+	
+	next_char = (unsigned int) ((unsigned char*) schrobuf_decrypted_text)[text_pos % text_len];	// modulo function to prevent going out of bounds for now
+	//next_char = ascii_vals[text_pos % text_len]; // Uncomment all ascii_vals above if want to test hardcoded text; comment out above statement
+	
+	/* If conditional_char is set, we are either rendering the last character 
+	 * that can fit on one line or the last character entirely.
+	 * Determine which case it is.
+	*/
+	if (conditional_char) {
+		/* If we are not rendering the last character, then we render a conditional character 
+		 * because we are at the end of a line. Look at current character requested 
+		 * to be rendered. If it is an alphabetic character (A/a - Z/z), then render a dash (-) 
+		 * as the conditional character. Otherwise render a space ( ).
+		 * If we are rendering the last character, then we have enough space to fit it.
+		 * Don't render conditional character in that case and just render actual character.
+		 */
+		if (text_pos != (text_len - 1)) {
+			if ( (next_char >= 65 && next_char <= 90) || (next_char >= 97 && next_char <= 122) )
+				next_char = DASH_CHAR;
+			else
+				next_char = SPACE_CHAR;
+		}
+	}
+	
+resolve:
+	next_char -= 32; /* Glyphbook starts at 32 on the ASCII table because ASCII codes for 0-31 are non visible characters. */
+
+	if (next_char >= schrobuf->num_buffers) {
+		PRINTK0("Something went wrong, requested character is outside glyphbook.\n");
+		next_char = 0; // render space instead
+	}
+	
+	return (void __user *) (schrobuf->buffers_mem + (next_char * schrobuf->buffer_size));
+}
 
 static int schrobuf_resolve(struct xen_schrobuf_resolve_data data)
 {
@@ -1457,6 +1528,10 @@ static int schrobuf_resolve(struct xen_schrobuf_resolve_data data)
 	if (!schrobuf) {
 		PRINTK_ERR("Error: schrobuf is NULL\n");
 		return -EINVAL;
+	}
+
+	if (!data.trust_addr && schrobuf_char_widths) {
+		schrobuf_adjust(&data);
 	} 
 
 	if ((data.dst_paddr & ~PAGE_MASK) + schrobuf->buffer_size >= PAGE_SIZE) {
